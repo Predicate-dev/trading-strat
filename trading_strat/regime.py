@@ -75,6 +75,16 @@ class RegimeFilter:
         return self.fit(data).predict(data)
 
     def add_regimes(self, data: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(data.index, pd.MultiIndex):
+            frames = []
+            for symbol, frame in data.groupby(level="symbol", sort=False):
+                enriched = self.add_regimes(frame.droplevel("symbol"))
+                enriched["symbol"] = symbol
+                frames.append(enriched)
+            result = pd.concat(frames).set_index("symbol", append=True).sort_index()
+            result.index = result.index.set_names(["date", "symbol"])
+            return result
+
         result = data.copy()
         result[self.label_column] = self.fit_predict(result)
         return result
@@ -103,18 +113,19 @@ class RegimeFilter:
             slope=("moving_average_slope", "mean"),
             drawdown=("drawdown", "mean"),
         )
-        high_vol_cluster = int(summary["volatility"].idxmax())
-        remaining = summary.drop(index=high_vol_cluster)
-        bull_score = remaining["trend"] + remaining["slope"] + remaining["drawdown"].clip(upper=0.0)
-        bull_cluster = int(bull_score.idxmax()) if not remaining.empty else high_vol_cluster
+        bull_score = summary["trend"] + summary["slope"] + summary["drawdown"].clip(lower=-0.20)
+        bull_cluster = int(bull_score.idxmax())
+        downside_vol_score = summary["volatility"] - summary["trend"] - summary["slope"] - summary["drawdown"]
+        downside_vol_score = downside_vol_score.drop(index=bull_cluster, errors="ignore")
+        high_vol_cluster = int(downside_vol_score.idxmax()) if not downside_vol_score.empty else bull_cluster
 
         labels: dict[int, RegimeLabel] = {}
         for cluster in summary.index:
             cluster_id = int(cluster)
-            if cluster_id == high_vol_cluster:
-                labels[cluster_id] = "High Volatility"
-            elif cluster_id == bull_cluster:
+            if cluster_id == bull_cluster:
                 labels[cluster_id] = "Bull Trend"
+            elif cluster_id == high_vol_cluster:
+                labels[cluster_id] = "High Volatility"
             else:
                 labels[cluster_id] = "Sideways"
         return labels

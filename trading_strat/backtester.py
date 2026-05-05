@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -15,6 +15,14 @@ from trading_strat.strategies import BaseStrategy
 LOGGER = logging.getLogger(__name__)
 
 SizingMode = Literal["fractional", "fixed"]
+
+
+@dataclass(frozen=True, slots=True)
+class ExitLogicResult:
+    positions: pd.Series
+    stop_exit: pd.Series
+    take_profit_exit: pd.Series
+    reason: pd.Series
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +54,7 @@ class BacktestResult:
     trade_returns: pd.Series
     drawdown: pd.Series
     stats: dict[str, float]
+    decision_ledger: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 class VectorizedBacktester:
@@ -70,22 +79,39 @@ class VectorizedBacktester:
             prices = data["close"].astype(float)
             raw_signals = strategy.generate_signals(data).reindex(prices.index).fillna(0.0)
             executable_signals = self._prepare_executable_signals(raw_signals)
-            positions = self._apply_exit_logic(data, executable_signals)
+            exit_result = self._apply_exit_logic(data, executable_signals)
+            positions = exit_result.positions
             weights = self._position_weights(prices, positions)
-            returns = self._calculate_net_returns(prices, weights)
+            turnover = weights.diff().abs().fillna(weights.abs())
+            costs = self._calculate_costs(prices, turnover)
+            returns = self._calculate_net_returns(prices, weights, costs)
             equity_curve = self.config.initial_capital * (1.0 + returns).cumprod()
             drawdown = self._calculate_drawdown(equity_curve)
-            trades = weights.diff().abs().fillna(weights.abs())
             trade_returns = self._trade_returns(prices, weights)
-            stats = self._calculate_stats(returns, equity_curve, drawdown, trades, trade_returns)
+            holding_periods = self._holding_periods(weights)
+            stats = self._calculate_stats(returns, equity_curve, drawdown, turnover, trade_returns)
+            stats.update(self._calculate_trade_stats(trade_returns, holding_periods, weights, drawdown))
+            ledger = self._build_decision_ledger(
+                data=data,
+                raw_signals=raw_signals,
+                executable_signals=executable_signals,
+                positions=weights,
+                turnover=turnover,
+                costs=costs,
+                returns=returns,
+                equity_curve=equity_curve,
+                drawdown=drawdown,
+                exit_result=exit_result,
+            )
             return BacktestResult(
                 equity_curve=equity_curve.rename("equity"),
                 returns=returns.rename("strategy_return"),
                 positions=weights.rename("position"),
-                trades=trades.rename("turnover"),
+                trades=turnover.rename("turnover"),
                 trade_returns=trade_returns,
                 drawdown=drawdown.rename("drawdown"),
                 stats=stats,
+                decision_ledger=ledger,
             )
         except Exception:
             LOGGER.exception("Backtest failed.")
@@ -108,10 +134,14 @@ class VectorizedBacktester:
 
         return weights.reindex(prices.index).fillna(0.0)
 
-    def _calculate_net_returns(self, prices: pd.Series, weights: pd.Series) -> pd.Series:
+    def _calculate_net_returns(self, prices: pd.Series, weights: pd.Series, costs: pd.Series | None = None) -> pd.Series:
         asset_returns = prices.pct_change().fillna(0.0)
         gross_returns = weights.fillna(0.0) * asset_returns
         turnover = weights.diff().abs().fillna(weights.abs())
+        cost_values = costs if costs is not None else self._calculate_costs(prices, turnover)
+        return (gross_returns - cost_values).fillna(0.0)
+
+    def _calculate_costs(self, prices: pd.Series, turnover: pd.Series) -> pd.Series:
         if self.config.slippage_model is not None:
             cost_rate = self.config.slippage_model.cost_rate(prices, turnover)
         else:
@@ -119,13 +149,13 @@ class VectorizedBacktester:
                 (self.config.commission_bps + self.config.slippage_bps) / 10_000.0,
                 index=prices.index,
             )
-        costs = turnover * cost_rate
-        return (gross_returns - costs).fillna(0.0)
+        return (turnover * cost_rate).fillna(0.0).rename("cost")
 
-    def _apply_exit_logic(self, data: pd.DataFrame, signals: pd.Series) -> pd.Series:
+    def _apply_exit_logic(self, data: pd.DataFrame, signals: pd.Series) -> ExitLogicResult:
         prices = data["close"].astype(float)
         if self.config.atr_stop_multiple is None and self.config.take_profit is None:
-            return signals
+            false_flags = pd.Series(False, index=signals.index)
+            return ExitLogicResult(signals, false_flags, false_flags, pd.Series("", index=signals.index, dtype=object))
         if self.config.atr_stop_multiple is not None and self.config.atr_column not in data.columns:
             raise ValueError(f"ATR trailing stop requires '{self.config.atr_column}' column.")
 
@@ -137,6 +167,9 @@ class VectorizedBacktester:
         )
         signal_array = signals.to_numpy(dtype=float)
         position_array = np.zeros_like(signal_array)
+        stop_exit_array = np.zeros_like(signal_array, dtype=bool)
+        take_profit_exit_array = np.zeros_like(signal_array, dtype=bool)
+        reason_array = np.full(len(signal_array), "", dtype=object)
         active_position = 0.0
         entry_price = np.nan
         trailing_stop = np.nan
@@ -164,11 +197,15 @@ class VectorizedBacktester:
                     entry_price = np.nan
                     trailing_stop = np.nan
                     position_array[idx] = active_position
+                    stop_exit_array[idx] = bool(stopped)
+                    take_profit_exit_array[idx] = bool(profit_taken)
+                    reason_array[idx] = "atr_trailing_stop" if stopped else "take_profit"
                     continue
 
             if desired_position != active_position:
                 active_position = desired_position
                 entry_price = current_price if active_position != 0.0 else np.nan
+                reason_array[idx] = "signal_change"
                 if self.config.atr_stop_multiple is None or active_position == 0.0:
                     trailing_stop = np.nan
                 elif active_position > 0.0 and atr_array[idx] > 0.0:
@@ -180,7 +217,12 @@ class VectorizedBacktester:
 
             position_array[idx] = active_position
 
-        return pd.Series(position_array, index=signals.index, name="position_signal")
+        return ExitLogicResult(
+            positions=pd.Series(position_array, index=signals.index, name="position_signal"),
+            stop_exit=pd.Series(stop_exit_array, index=signals.index, name="stop_exit"),
+            take_profit_exit=pd.Series(take_profit_exit_array, index=signals.index, name="take_profit_exit"),
+            reason=pd.Series(reason_array, index=signals.index, name="reason"),
+        )
 
     def _calculate_stats(
         self,
@@ -217,6 +259,29 @@ class VectorizedBacktester:
         }
 
     @staticmethod
+    def _calculate_trade_stats(
+        trade_returns: pd.Series,
+        holding_periods: pd.Series,
+        weights: pd.Series,
+        drawdown: pd.Series,
+    ) -> dict[str, float]:
+        wins = trade_returns[trade_returns > 0.0]
+        losses = trade_returns[trade_returns < 0.0]
+        gross_profit = wins.sum()
+        gross_loss = abs(losses.sum())
+        profit_factor = np.nan if gross_loss == 0.0 else gross_profit / gross_loss
+        return {
+            "profit_factor": float(profit_factor),
+            "average_win": float(wins.mean()) if not wins.empty else float("nan"),
+            "average_loss": float(losses.mean()) if not losses.empty else float("nan"),
+            "exposure_time": float(weights.ne(0.0).mean()),
+            "drawdown_duration": float(VectorizedBacktester._max_consecutive(drawdown.lt(0.0))),
+            "best_trade": float(trade_returns.max()) if not trade_returns.empty else float("nan"),
+            "worst_trade": float(trade_returns.min()) if not trade_returns.empty else float("nan"),
+            "average_holding_period": float(holding_periods.mean()) if not holding_periods.empty else float("nan"),
+        }
+
+    @staticmethod
     def _calculate_drawdown(equity_curve: pd.Series) -> pd.Series:
         running_max = equity_curve.cummax()
         return equity_curve / running_max - 1.0
@@ -241,3 +306,105 @@ class VectorizedBacktester:
             trade_returns.append(active_direction * (prices.iloc[-1] / entry_price - 1.0))
 
         return pd.Series(trade_returns, name="trade_return", dtype=float)
+
+    @staticmethod
+    def _holding_periods(weights: pd.Series) -> pd.Series:
+        periods: list[int] = []
+        active = False
+        length = 0
+        for weight in weights:
+            if weight != 0.0:
+                active = True
+                length += 1
+            elif active:
+                periods.append(length)
+                active = False
+                length = 0
+        if active:
+            periods.append(length)
+        return pd.Series(periods, name="holding_period", dtype=float)
+
+    @staticmethod
+    def _max_consecutive(mask: pd.Series) -> int:
+        longest = 0
+        current = 0
+        for value in mask.fillna(False):
+            if value:
+                current += 1
+                longest = max(longest, current)
+            else:
+                current = 0
+        return longest
+
+    def _build_decision_ledger(
+        self,
+        data: pd.DataFrame,
+        raw_signals: pd.Series,
+        executable_signals: pd.Series,
+        positions: pd.Series,
+        turnover: pd.Series,
+        costs: pd.Series,
+        returns: pd.Series,
+        equity_curve: pd.Series,
+        drawdown: pd.Series,
+        exit_result: ExitLogicResult,
+    ) -> pd.DataFrame:
+        ledger = pd.DataFrame(
+            {
+                "date": data.index,
+                "close": data["close"].astype(float),
+                "raw_signal": raw_signals,
+                "executable_signal": executable_signals,
+                "position": positions,
+                "turnover": turnover,
+                "cost": costs,
+                "strategy_return": returns,
+                "equity": equity_curve,
+                "drawdown": drawdown,
+                "stop_exit": exit_result.stop_exit,
+                "take_profit_exit": exit_result.take_profit_exit,
+                "reason": exit_result.reason,
+            },
+            index=data.index,
+        )
+        previous_position = positions.shift(1).fillna(0.0)
+        action = pd.Series("hold", index=data.index, dtype=object)
+        action = action.mask((previous_position == 0.0) & (positions > 0.0), "buy")
+        action = action.mask((previous_position == 0.0) & (positions < 0.0), "sell_short")
+        action = action.mask((previous_position != 0.0) & (positions == 0.0), "exit")
+        action = action.mask((previous_position < 0.0) & (positions > 0.0), "cover_and_buy")
+        action = action.mask((previous_position > 0.0) & (positions < 0.0), "sell_and_short")
+        ledger["trade_action"] = action
+        ledger.loc[(ledger["reason"] == "") & (ledger["trade_action"] != "hold"), "reason"] = "signal_change"
+        ledger.loc[ledger["reason"] == "", "reason"] = "hold"
+
+        optional_columns = [
+            "predicted_return",
+            "probability_up",
+            "confidence",
+            "model_name",
+            "fold",
+            "regime",
+        ]
+        for column in optional_columns:
+            if column in data.columns:
+                ledger[column] = data[column]
+
+        preferred_order = [
+            "date",
+            "close",
+            "raw_signal",
+            "executable_signal",
+            "position",
+            "turnover",
+            "cost",
+            "strategy_return",
+            "equity",
+            "drawdown",
+            "trade_action",
+            "reason",
+            "stop_exit",
+            "take_profit_exit",
+        ]
+        trailing_columns = [column for column in ledger.columns if column not in preferred_order]
+        return ledger[preferred_order + trailing_columns]
